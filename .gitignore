@@ -1,0 +1,68 @@
+# Python
+.venv/
+.venv_vllm/
+.git_backup_before_reinit/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / frontend
+node_modules/
+dist/
+build/
+coverage/
+
+# Environment and secrets
+.env
+*.env
+!.env.example
+agent/.env
+app/.env
+
+# Local IDE / OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local project introduction materials
+introduce/
+
+# Local scratch tests
+test/
+
+# Logs and runtime files
+*.log
+logs/
+*.pid
+
+# Docker / database local data
+volumes/
+docker-volumes/
+milvus_data/
+minio_data/
+etcd_data/
+mysql_data/
+redis_data/
+neo4j_data/
+
+# Model weights and local caches
+models/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+
+# Generated media / temp
+tmp/
+temp/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.mp4
