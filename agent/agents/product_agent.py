@@ -1,14 +1,61 @@
 import os
+import time
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 
 # 导入已经封装好的工具
 from tools.vector_tool import query_vector_db
 from tools.graph_tool import query_knowledge_graph
 from core.workflow.state import AgentState
+from core.observability import trace_log, trace_ms
 from typing import Dict, Any
+
+
+class _ProductTraceCallback(BaseCallbackHandler):
+    def __init__(self, trace_id: str | None, user_id: str | None, session_id: str | None):
+        self.trace_id = trace_id
+        self.user_id = user_id
+        self.session_id = session_id
+        self._llm_starts: list[float] = []
+
+    def on_chat_model_start(self, serialized, messages, **kwargs):
+        self._llm_starts.append(time.perf_counter())
+        trace_log(
+            self.trace_id,
+            "product_llm_start",
+            user_id=self.user_id,
+            session_id=self.session_id,
+            agent="product_agent",
+            message_batches=len(messages) if messages else 0,
+        )
+
+    def on_llm_end(self, response, **kwargs):
+        start = self._llm_starts.pop() if self._llm_starts else time.perf_counter()
+        trace_log(
+            self.trace_id,
+            "product_llm_end",
+            user_id=self.user_id,
+            session_id=self.session_id,
+            agent="product_agent",
+            latency_ms=trace_ms(start),
+        )
+
+    def on_llm_error(self, error, **kwargs):
+        start = self._llm_starts.pop() if self._llm_starts else time.perf_counter()
+        trace_log(
+            self.trace_id,
+            "product_llm_error",
+            user_id=self.user_id,
+            session_id=self.session_id,
+            agent="product_agent",
+            latency_ms=trace_ms(start),
+            error=str(error),
+        )
+
 
 class ProductAgentNode:
     """
@@ -27,10 +74,100 @@ class ProductAgentNode:
         )
         self.tools = [query_vector_db, query_knowledge_graph]
 
+    def _build_traced_tools(self, trace_id: str | None, user_id: str | None, session_id: str | None):
+        @tool("query_vector_db", description=query_vector_db.description)
+        def traced_query_vector_db(query: str) -> str:
+            start = time.perf_counter()
+            trace_log(
+                trace_id,
+                "product_tool_start",
+                user_id=user_id,
+                session_id=session_id,
+                agent="product_agent",
+                tool="query_vector_db",
+                query=query,
+            )
+            try:
+                result = query_vector_db.invoke({"query": query})
+                trace_log(
+                    trace_id,
+                    "product_tool_end",
+                    user_id=user_id,
+                    session_id=session_id,
+                    agent="product_agent",
+                    tool="query_vector_db",
+                    latency_ms=trace_ms(start),
+                    result_chars=len(result) if isinstance(result, str) else 0,
+                )
+                return result
+            except Exception as exc:
+                trace_log(
+                    trace_id,
+                    "product_tool_error",
+                    user_id=user_id,
+                    session_id=session_id,
+                    agent="product_agent",
+                    tool="query_vector_db",
+                    latency_ms=trace_ms(start),
+                    error=str(exc),
+                )
+                raise
+
+        @tool("query_knowledge_graph", description=query_knowledge_graph.description)
+        def traced_query_knowledge_graph(query: str) -> str:
+            start = time.perf_counter()
+            trace_log(
+                trace_id,
+                "product_tool_start",
+                user_id=user_id,
+                session_id=session_id,
+                agent="product_agent",
+                tool="query_knowledge_graph",
+                query=query,
+            )
+            try:
+                result = query_knowledge_graph.invoke({"query": query})
+                trace_log(
+                    trace_id,
+                    "product_tool_end",
+                    user_id=user_id,
+                    session_id=session_id,
+                    agent="product_agent",
+                    tool="query_knowledge_graph",
+                    latency_ms=trace_ms(start),
+                    result_chars=len(result) if isinstance(result, str) else 0,
+                )
+                return result
+            except Exception as exc:
+                trace_log(
+                    trace_id,
+                    "product_tool_error",
+                    user_id=user_id,
+                    session_id=session_id,
+                    agent="product_agent",
+                    tool="query_knowledge_graph",
+                    latency_ms=trace_ms(start),
+                    error=str(exc),
+                )
+                raise
+
+        return [traced_query_vector_db, traced_query_knowledge_graph]
+
     async def __call__(self, state: AgentState) -> Dict[str, Any]:
         """
         供主 LangGraph 调用的处理函数
         """
+        trace_id = state.get("trace_id")
+        user_id = state.get("user_id")
+        session_id = state.get("session_id")
+        agent_start = time.perf_counter()
+        trace_log(
+            trace_id,
+            "product_agent_start",
+            user_id=user_id,
+            session_id=session_id,
+            agent="product_agent",
+        )
         memory_context = state.get("memory_context", "")
         system_prompt = f"""你是一个专业的云服务平台【产品咨询Agent】。
 你的任务是解答用户关于云产品（如云服务器ECS、专有网络VPC等）的疑问。
@@ -63,19 +200,44 @@ class ProductAgentNode:
 {memory_context if memory_context else "暂无背景上下文。"}
 """
         # 使用 create_react_agent 创建一个内部的执行器
+        traced_tools = self._build_traced_tools(trace_id, user_id, session_id)
         inner_agent = create_react_agent(
             model=self.llm,
-            tools=self.tools,
+            tools=traced_tools,
             prompt=system_prompt
         )
         
         print("💡 [ProductAgent] 正在处理产品咨询请求...")
         
         # 传递整个对话历史给内部 agent
-        result = await inner_agent.ainvoke({"messages": state["messages"]})
+        try:
+            result = await inner_agent.ainvoke(
+                {"messages": state["messages"]},
+                config={"callbacks": [_ProductTraceCallback(trace_id, user_id, session_id)]},
+            )
+        except Exception as exc:
+            trace_log(
+                trace_id,
+                "product_agent_error",
+                user_id=user_id,
+                session_id=session_id,
+                agent="product_agent",
+                latency_ms=trace_ms(agent_start),
+                error=str(exc),
+            )
+            raise
         
         # 提取最后一条 AI 消息返回给主图
         final_message = result["messages"][-1]
+        trace_log(
+            trace_id,
+            "product_agent_end",
+            user_id=user_id,
+            session_id=session_id,
+            agent="product_agent",
+            latency_ms=trace_ms(agent_start),
+            response_chars=len(final_message.content) if getattr(final_message, "content", None) else 0,
+        )
         
         # 为了兼容主图的消息追加，我们将返回包装在 messages 列表中
         return {"messages": [final_message]}

@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-from router import chat, users
+from router import chat, traces, users
 from service.chat_service import init_agent_system, shutdown_agent_system
 
 @asynccontextmanager
@@ -34,6 +34,7 @@ app.add_middleware(
 
 # 注册路由
 app.include_router(chat.router, prefix="/api")
+app.include_router(traces.router, prefix="/api")
 app.include_router(users.router, prefix="/api")
 
 if __name__ == "__main__":

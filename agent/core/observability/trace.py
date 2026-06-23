@@ -1,11 +1,23 @@
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
+from threading import Lock
 from typing import Any
 
 
 MAX_FIELD_LENGTH = 800
+DEFAULT_TRACE_LIMIT = 20
+MAX_TRACE_LIMIT = 200
+TRACE_LOG_PATH = Path(
+    os.getenv(
+        "AGENT_TRACE_LOG_PATH",
+        Path(__file__).resolve().parents[3] / "logs" / "agent_trace.jsonl",
+    )
+)
+_trace_write_lock = Lock()
 
 
 def new_trace_id() -> str:
@@ -30,6 +42,82 @@ def _safe_value(value: Any) -> Any:
         return value
     except TypeError:
         return str(value)
+
+
+def _write_trace_record(record: dict[str, Any]) -> None:
+    try:
+        TRACE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
+        with _trace_write_lock:
+            with TRACE_LOG_PATH.open("a", encoding="utf-8") as file:
+                file.write(line)
+    except Exception as exc:
+        print(f"[AGENT_TRACE_STORE_ERROR] {exc}")
+
+
+def read_trace_events(trace_id: str) -> list[dict[str, Any]]:
+    if not TRACE_LOG_PATH.exists():
+        return []
+
+    events: list[dict[str, Any]] = []
+    with TRACE_LOG_PATH.open("r", encoding="utf-8") as file:
+        for line in file:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("trace_id") == trace_id:
+                events.append(record)
+    return events
+
+
+def list_recent_traces(limit: int = DEFAULT_TRACE_LIMIT) -> list[dict[str, Any]]:
+    if not TRACE_LOG_PATH.exists():
+        return []
+
+    limit = max(1, min(limit, MAX_TRACE_LIMIT))
+    summaries: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+
+    with TRACE_LOG_PATH.open("r", encoding="utf-8") as file:
+        for line in file:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            trace_id = record.get("trace_id")
+            if not trace_id:
+                continue
+
+            if trace_id not in summaries:
+                order.append(trace_id)
+                summaries[trace_id] = {
+                    "trace_id": trace_id,
+                    "start_ts": record.get("ts"),
+                    "end_ts": record.get("ts"),
+                    "events": 0,
+                    "user_id": record.get("user_id"),
+                    "session_id": record.get("session_id"),
+                    "query": record.get("payload", {}).get("query"),
+                    "total_latency_ms": None,
+                    "last_event": record.get("event"),
+                }
+
+            summary = summaries[trace_id]
+            summary["end_ts"] = record.get("ts")
+            summary["events"] += 1
+            summary["last_event"] = record.get("event")
+            if record.get("user_id"):
+                summary["user_id"] = record.get("user_id")
+            if record.get("session_id"):
+                summary["session_id"] = record.get("session_id")
+            if record.get("event") == "chat_start":
+                summary["query"] = record.get("payload", {}).get("query")
+            if record.get("event") == "chat_end":
+                summary["total_latency_ms"] = record.get("latency_ms")
+
+    return [summaries[trace_id] for trace_id in reversed(order[-limit:])]
 
 
 def trace_log(
@@ -62,3 +150,4 @@ def trace_log(
         record["payload"] = _safe_value(payload)
 
     print("[AGENT_TRACE] " + json.dumps(record, ensure_ascii=False, default=str))
+    _write_trace_record(record)

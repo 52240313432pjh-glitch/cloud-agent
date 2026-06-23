@@ -200,4 +200,4 @@ async def stream_chat(query: str, user_id: str, session_id: str):
         latency_ms=trace_ms(chat_start),
         response_chars=len(response_text),
     )
-    yield f"data: {json.dumps({'done': True})}\n\n"
+    yield f"data: {json.dumps({'done': True, 'trace_id': trace_id})}\n\n"

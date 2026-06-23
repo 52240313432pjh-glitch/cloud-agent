@@ -113,7 +113,14 @@
             <div :class="['msg-avatar', msg.role === 'user' ? 'user-avatar' : 'ai-avatar']">
               {{ msg.role === 'user' ? 'U' : 'AI' }}
             </div>
-            <div class="message-bubble" v-html="renderMarkdown(msg.content)"></div>
+            <div class="message-content">
+              <div class="message-bubble" v-html="renderMarkdown(msg.content)"></div>
+              <div v-if="msg.role === 'assistant' && msg.traceId" class="message-actions">
+                <el-button size="small" text type="primary" @click="openTrace(msg.traceId)">
+                  查看链路
+                </el-button>
+              </div>
+            </div>
           </div>
           
           <div v-if="isLoading" class="message-row assistant">
@@ -146,6 +153,78 @@
         </div>
       </el-main>
     </el-container>
+
+    <el-drawer
+      v-model="traceDrawerVisible"
+      title="Agent Trace"
+      size="520px"
+      direction="rtl"
+      class="trace-drawer"
+    >
+      <div v-if="traceLoading" class="trace-loading">
+        <el-icon class="is-loading"><Loading /></el-icon>
+        <span>正在加载链路...</span>
+      </div>
+      <div v-else-if="traceError" class="trace-error">{{ traceError }}</div>
+      <div v-else-if="activeTrace">
+        <div class="trace-summary">
+          <div class="trace-id">{{ activeTrace.trace_id }}</div>
+          <div class="trace-metrics">
+            <div class="trace-metric">
+              <span>总耗时</span>
+              <strong>{{ formatLatency(traceStats.totalLatency) }}</strong>
+            </div>
+            <div class="trace-metric">
+              <span>缓存</span>
+              <strong>{{ traceStats.cacheStatus }}</strong>
+            </div>
+            <div class="trace-metric">
+              <span>路由</span>
+              <strong>{{ traceStats.route || '-' }}</strong>
+            </div>
+            <div class="trace-metric">
+              <span>事件数</span>
+              <strong>{{ activeTrace.count }}</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="trace-breakdown">
+          <div
+            v-for="item in traceStats.breakdown"
+            :key="item.label"
+            class="trace-breakdown-item"
+          >
+            <span>{{ item.label }}</span>
+            <strong>{{ formatLatency(item.latency) }}</strong>
+          </div>
+        </div>
+
+        <el-timeline class="trace-timeline">
+          <el-timeline-item
+            v-for="(event, index) in activeTrace.events"
+            :key="`${event.event}-${index}`"
+            :timestamp="formatTraceTime(event.ts)"
+            placement="top"
+          >
+            <div class="trace-event">
+              <div class="trace-event-head">
+                <span class="trace-event-name">{{ event.event }}</span>
+                <span v-if="event.latency_ms !== undefined" class="trace-event-latency">
+                  {{ formatLatency(event.latency_ms) }}
+                </span>
+              </div>
+              <div class="trace-event-meta">
+                <span v-if="event.agent">agent={{ event.agent }}</span>
+                <span v-if="event.tool">tool={{ event.tool }}</span>
+              </div>
+              <pre v-if="event.payload" class="trace-payload">{{ formatPayload(event.payload) }}</pre>
+            </div>
+          </el-timeline-item>
+        </el-timeline>
+      </div>
+      <el-empty v-else description="暂无链路数据" />
+    </el-drawer>
   </div>
 </template>
 
@@ -164,6 +243,7 @@ const currentSessionId = ref('session_default_1')
 interface Message {
   role: 'user' | 'assistant'
   content: string
+  traceId?: string
 }
 
 interface UserOption {
@@ -171,8 +251,41 @@ interface UserOption {
   label: string
 }
 
+interface TraceEvent {
+  ts: string
+  trace_id: string
+  event: string
+  user_id?: string
+  session_id?: string
+  agent?: string
+  tool?: string
+  latency_ms?: number
+  payload?: Record<string, unknown>
+}
+
+interface TraceDetail {
+  trace_id: string
+  events: TraceEvent[]
+  count: number
+}
+
+interface TraceBreakdownItem {
+  label: string
+  latency?: number
+}
+
 const messages = ref<Message[]>([])
 const users = ref<UserOption[]>([])
+const traceDrawerVisible = ref(false)
+const traceLoading = ref(false)
+const traceError = ref('')
+const activeTrace = ref<TraceDetail | null>(null)
+const traceStats = ref({
+  totalLatency: undefined as number | undefined,
+  cacheStatus: '-',
+  route: '',
+  breakdown: [] as TraceBreakdownItem[]
+})
 const fallbackUsers: UserOption[] = [
   { id: 'user_1001', label: 'user_1001 · 企业客户' },
   { id: 'user_1002', label: 'user_1002 · 个人开发者' }
@@ -196,7 +309,7 @@ const loadUsers = async () => {
     const data = await response.json()
     users.value = data.users?.length ? data.users : fallbackUsers
     if (!users.value.some(user => user.id === currentUserId.value)) {
-      currentUserId.value = users.value[0].id
+      currentUserId.value = users.value[0]?.id || 'user_1002'
       resetSessionForCurrentUser()
     }
   } catch (error) {
@@ -230,6 +343,71 @@ const resetSessionForCurrentUser = () => {
 
 const renderMarkdown = (text: string) => {
   return marked(text)
+}
+
+const formatLatency = (latency?: number) => {
+  if (latency === undefined || latency === null) return '-'
+  if (latency >= 1000) return `${(latency / 1000).toFixed(2)}s`
+  return `${latency}ms`
+}
+
+const formatTraceTime = (ts: string) => {
+  const date = new Date(ts)
+  if (Number.isNaN(date.getTime())) return ts
+  return date.toLocaleTimeString()
+}
+
+const formatPayload = (payload: Record<string, unknown>) => {
+  return JSON.stringify(payload, null, 2)
+}
+
+const buildTraceStats = (trace: TraceDetail) => {
+  const events = trace.events
+  const findEvent = (name: string) => events.find(event => event.event === name)
+  const findLastEvent = (name: string) => [...events].reverse().find(event => event.event === name)
+  const toolEvents = events.filter(event => event.event === 'product_tool_end')
+  const llmEvents = events.filter(event => event.event === 'product_llm_end')
+  const routeEvent = findEvent('orchestrator_route')
+
+  traceStats.value = {
+    totalLatency: findLastEvent('chat_end')?.latency_ms,
+    cacheStatus: findEvent('cache_hit') ? '命中' : findEvent('cache_miss') ? '未命中' : '-',
+    route: String(routeEvent?.payload?.next_agent || routeEvent?.payload?.decision || ''),
+    breakdown: [
+      { label: 'Workflow', latency: findLastEvent('workflow_end')?.latency_ms },
+      { label: 'ProductAgent', latency: findLastEvent('product_agent_end')?.latency_ms },
+      ...toolEvents.map(event => ({
+        label: String(event.tool || event.event),
+        latency: event.latency_ms
+      })),
+      {
+        label: 'LLM 累计',
+        latency: llmEvents.reduce((sum, event) => sum + (event.latency_ms || 0), 0)
+      }
+    ].filter(item => item.latency !== undefined)
+  }
+}
+
+const openTrace = async (traceId: string) => {
+  traceDrawerVisible.value = true
+  traceLoading.value = true
+  traceError.value = ''
+  activeTrace.value = null
+
+  try {
+    const response = await fetch(`http://127.0.0.1:5000/api/traces/${traceId}`)
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`)
+    }
+    const data = await response.json()
+    activeTrace.value = data
+    buildTraceStats(data)
+  } catch (error) {
+    console.error('Load trace failed:', error)
+    traceError.value = '链路数据加载失败，请确认后端服务和 Trace 日志是否可用。'
+  } finally {
+    traceLoading.value = false
+  }
 }
 
 const scrollToBottom = async () => {
@@ -308,6 +486,9 @@ const sendQuery = async (query: string) => {
                 scrollToBottom()
               }
               if (data.done) {
+                if (data.trace_id && messages.value[currentMsgIndex]) {
+                  messages.value[currentMsgIndex].traceId = data.trace_id
+                }
                 // 流传输完成
               }
             } catch (e) {
@@ -595,6 +776,17 @@ const sendQuery = async (query: string) => {
 .message-bubble :deep(img) { max-width: 100%; border-radius: 8px; margin-top: 10px; }
 .message-bubble :deep(pre) { background: #f4f4f5; padding: 10px; border-radius: 6px; overflow-x: auto; }
 .message-bubble :deep(code) { font-family: monospace; }
+.message-content {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.message-actions {
+  display: flex;
+  justify-content: flex-start;
+  padding-left: 4px;
+}
 
 .input-area {
   padding: 16px 28px 20px;
@@ -608,5 +800,104 @@ const sendQuery = async (query: string) => {
   align-self: flex-end;
   width: 110px;
   border-radius: 10px;
+}
+
+.trace-loading,
+.trace-error {
+  min-height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #64748b;
+}
+.trace-error {
+  color: #dc2626;
+}
+.trace-summary {
+  padding: 14px;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  background: #f8fafc;
+  margin-bottom: 14px;
+}
+.trace-id {
+  font-family: monospace;
+  font-size: 12px;
+  color: #475569;
+  word-break: break-all;
+  margin-bottom: 12px;
+}
+.trace-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.trace-metric,
+.trace-breakdown-item {
+  padding: 10px;
+  border-radius: 8px;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+.trace-metric span,
+.trace-breakdown-item span {
+  color: #64748b;
+  font-size: 12px;
+}
+.trace-metric strong,
+.trace-breakdown-item strong {
+  color: #0f172a;
+  font-size: 13px;
+}
+.trace-breakdown {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+.trace-timeline {
+  padding-left: 4px;
+}
+.trace-event {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  background: #ffffff;
+  padding: 10px 12px;
+}
+.trace-event-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.trace-event-name {
+  font-weight: 700;
+  color: #1e293b;
+}
+.trace-event-latency {
+  font-size: 12px;
+  color: #2563eb;
+  font-weight: 700;
+}
+.trace-event-meta {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: #64748b;
+  font-size: 12px;
+}
+.trace-payload {
+  margin: 8px 0 0;
+  padding: 8px;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #334155;
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
 }
 </style>
