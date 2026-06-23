@@ -49,6 +49,7 @@ async def init_agent_system():
             milvus_api_key=settings.milvus_api_key,
             embedding_api_key=settings.dashscope_api_key,
             embedding_model=settings.embedding_model,
+            embedding_dim=settings.embedding_dim,
         )
         await memory.initialize()
         await semantic_cache.initialize()
@@ -88,6 +89,23 @@ async def _extract_memory_context(user_id: str, session_id: str, query: str) -> 
                 
     return "\n".join(context_parts)
 
+async def _extract_layered_memory_context(user_id: str, session_id: str, query: str):
+    if not memory:
+        return "", {
+            "summary_chars": 0,
+            "recent_messages": 0,
+            "preferences_count": 0,
+        }
+
+    layered = await memory.get_layered_context(user_id, session_id, query)
+    return layered.context, {
+        "summary_chars": len(layered.summary),
+        "recent_messages": len(layered.recent_messages),
+        "preferences_count": len(layered.preferences),
+        "related_history_count": len(layered.related_history),
+        "related_history_chars": sum(len(item) for item in layered.related_history),
+    }
+
 async def _background_extract_preferences(user_id: str, session_id: str) -> None:
     if not memory or not memory_llm or not memory.long_term.available:
         return
@@ -119,7 +137,8 @@ async def stream_chat(query: str, user_id: str, session_id: str):
             session_id=session_id,
             latency_ms=trace_ms(cache_start),
             level=cache_hit.get("level"),
-            distance=cache_hit.get("distance"),
+            similarity=cache_hit.get("similarity"),
+            cosine_distance=cache_hit.get("cosine_distance"),
             matched_question=cache_hit.get("matched_question"),
         )
         print(
@@ -135,7 +154,7 @@ async def stream_chat(query: str, user_id: str, session_id: str):
             latency_ms=trace_ms(cache_start),
         )
         memory_start = time.perf_counter()
-        mem_context = await _extract_memory_context(user_id, session_id, query)
+        mem_context, memory_stats = await _extract_layered_memory_context(user_id, session_id, query)
         trace_log(
             trace_id,
             "memory_loaded",
@@ -143,6 +162,7 @@ async def stream_chat(query: str, user_id: str, session_id: str):
             session_id=session_id,
             latency_ms=trace_ms(memory_start),
             context_chars=len(mem_context),
+            **memory_stats,
         )
         state = {
             "messages": [("user", query)],
@@ -174,7 +194,7 @@ async def stream_chat(query: str, user_id: str, session_id: str):
             {"role": "user", "content": query},
             {"role": "assistant", "content": response_text},
         ]
-        await memory.save_conversation(user_id, session_id, turn)
+        await memory.save_conversation(user_id, session_id, turn, llm=memory_llm)
         trace_log(
             trace_id,
             "memory_saved",

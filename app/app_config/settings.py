@@ -6,6 +6,7 @@ ENV_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.
 class Settings(BaseSettings):
     dashscope_api_key: str
     embedding_model: str = "text-embedding-v2"
+    embedding_dim: int = 1536
     redis_url: str
     milvus_host: str = "localhost"
     milvus_port: int = 19530

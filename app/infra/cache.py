@@ -6,7 +6,7 @@ from app_config.settings import settings
 
 COLLECTION_NAME = "qa_semantic_cache"
 EMBEDDING_DIM = 1536
-L1_SEMANTIC_DISTANCE_THRESHOLD = 0.03
+L1_SEMANTIC_SIMILARITY_THRESHOLD = 0.86
 
 
 class SemanticCache:
@@ -94,6 +94,8 @@ class SemanticCache:
                 "answer": user_exact["answer"],
                 "matched_question": user_exact["question"],
                 "level": "L1_EXACT",
+                "similarity": 1.0,
+                "cosine_distance": 0.0,
                 "distance": 0.0,
             }
 
@@ -103,6 +105,8 @@ class SemanticCache:
                 "answer": public_exact["answer"],
                 "matched_question": public_exact["question"],
                 "level": "L1_EXACT",
+                "similarity": 1.0,
+                "cosine_distance": 0.0,
                 "distance": 0.0,
             }
 
@@ -123,15 +127,17 @@ class SemanticCache:
             hit = results[0][0] if results[0] else None
             if not hit:
                 return None
-            distance = float(hit.get("distance", 1.0))
-            if distance > L1_SEMANTIC_DISTANCE_THRESHOLD:
+            similarity = float(hit.get("distance", 0.0))
+            if similarity < L1_SEMANTIC_SIMILARITY_THRESHOLD:
                 return None
             entity = hit.get("entity", {})
             return {
                 "answer": entity.get("answer", ""),
                 "matched_question": entity.get("question", ""),
                 "level": "L1_SEMANTIC",
-                "distance": distance,
+                "similarity": similarity,
+                "cosine_distance": 1 - similarity,
+                "distance": 1 - similarity,
             }
         except Exception as exc:
             print(f"SemanticCache get_cache failed: {exc}")

@@ -19,16 +19,33 @@ MemoryManager 是代理框架中所有内存操作的单一入口点。它委托
 """
 
 import logging
+import os
+from dataclasses import dataclass
 from typing import Any
 
 from .short_term import ShortTermMemory
 from .long_term import LongTermMemory
+from .conversation_history import ConversationHistoryMemory
 from .preference_extractor import PreferenceExtractor
 
 logger = logging.getLogger(__name__)
 
 _TOP_K_PREFERENCES = 20   # max preferences to retrieve per user
 _MAX_HISTORY_TURNS = 20   # max conversation turns used for extraction
+_RECENT_CONTEXT_MESSAGES = 6
+_SUMMARY_TRIGGER_MESSAGES = 8
+_SUMMARY_MAX_CHARS = 800
+_TOP_K_RELATED_HISTORY = 3
+_HISTORY_SUMMARY_MAX_CHARS = 700
+_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v2")
+
+@dataclass
+class LayeredMemoryContext:
+    context: str
+    summary: str
+    preferences: list[str]
+    related_history: list[str]
+    recent_messages: list[dict[str, Any]]
 
 
 class MemoryManager:
@@ -67,7 +84,8 @@ class MemoryManager:
         milvus_port: int = 19530,
         milvus_api_key: str | None = None,
         embedding_api_key: str | None = None,
-        embedding_model: str = "text-embedding-v2",
+        embedding_model: str = _EMBEDDING_MODEL,
+        embedding_dim: int = 1536,
     ) -> None:
         self.short_term = ShortTermMemory(redis_url=redis_url, ttl=redis_ttl)
         self.long_term = LongTermMemory(
@@ -76,6 +94,15 @@ class MemoryManager:
             api_key=milvus_api_key,
             embedding_api_key=embedding_api_key,
             embedding_model=embedding_model,
+            embedding_dim=embedding_dim,
+        )
+        self.conversation_history = ConversationHistoryMemory(
+            host=milvus_host,
+            port=milvus_port,
+            api_key=milvus_api_key,
+            embedding_api_key=embedding_api_key,
+            embedding_model=embedding_model,
+            embedding_dim=embedding_dim,
         )
 
     # ------------------------------------------------------------------
@@ -89,6 +116,7 @@ class MemoryManager:
         await asyncio.gather(
             self.short_term.initialize(),
             self.long_term.initialize(),
+            self.conversation_history.initialize(),
             return_exceptions=True,
         )
         logger.info(
@@ -104,6 +132,7 @@ class MemoryManager:
         await asyncio.gather(
             self.short_term.close(),
             self.long_term.close(),
+            self.conversation_history.close(),
             return_exceptions=True,
         )
         logger.info("MemoryManager closed")
@@ -117,6 +146,7 @@ class MemoryManager:
         user_id: str,
         session_id: str,
         messages: list[dict[str, Any]],
+        llm: Any | None = None,
     ) -> None:
         """Persist conversation messages to short-term (Redis) memory.
 
@@ -133,6 +163,28 @@ class MemoryManager:
         # Append to existing history instead of overwriting
         existing = await self.short_term.get_messages(user_id, session_id)
         combined = existing + non_system
+        await self._save_conversation_history(
+            user_id=user_id,
+            session_id=session_id,
+            messages=non_system,
+            llm=llm,
+        )
+
+        if llm is not None and len([m for m in combined if m.get("role") != "system"]) > _SUMMARY_TRIGGER_MESSAGES:
+            summary_saved = await self._update_session_summary(
+                user_id=user_id,
+                session_id=session_id,
+                messages=combined,
+                llm=llm,
+            )
+            if summary_saved:
+                logger.debug(
+                    "[MEMORY] Summarized session and kept recent messages for %s:%s",
+                    user_id,
+                    session_id,
+                )
+                return
+
         await self.short_term.save_messages(user_id, session_id, combined)
         logger.debug(
             "[MEMORY] Appended %d messages (total %d) for %s:%s",
@@ -152,6 +204,209 @@ class MemoryManager:
             List of message dicts (may be empty if Redis is unavailable).
         """
         return await self.short_term.get_messages(user_id, session_id)
+
+    async def get_layered_context(
+        self,
+        user_id: str,
+        session_id: str,
+        query: str,
+        top_k_preferences: int = 3,
+        top_k_history: int = _TOP_K_RELATED_HISTORY,
+    ) -> LayeredMemoryContext:
+        """Build L1/L2/L3 memory context for the current turn.
+
+        L1: recent raw messages from Redis.
+        L2: session summary from Redis.
+        L3: relevant long-term preferences from Milvus.
+        """
+        summary = ""
+        recent_messages: list[dict[str, Any]] = []
+        preferences: list[str] = []
+        related_history: list[str] = []
+
+        if self.short_term.available:
+            summary = await self.short_term.get_summary(user_id, session_id)
+            history = await self.short_term.get_messages(user_id, session_id)
+            non_system = [m for m in history if m.get("role") != "system"]
+            recent_messages = non_system[-_RECENT_CONTEXT_MESSAGES:]
+
+        if self.long_term.available:
+            preferences = await self.load_preferences(
+                user_id=user_id,
+                query=query,
+                top_k=top_k_preferences,
+            )
+
+        if self.conversation_history.available:
+            related_history = await self.conversation_history.retrieve_relevant(
+                user_id=user_id,
+                query=query,
+                current_session_id=session_id,
+                top_k=top_k_history,
+            )
+
+        parts: list[str] = []
+        if summary:
+            parts.append("【会话摘要】")
+            parts.append(summary)
+
+        if preferences:
+            parts.append("\n【长期用户偏好】")
+            parts.extend(f"- {item}" for item in preferences)
+
+        if related_history:
+            parts.append("\n【跨会话相关历史】")
+            parts.extend(f"- {item}" for item in related_history)
+
+        if recent_messages:
+            parts.append("\n【最近对话】")
+            for msg in recent_messages:
+                role = "User" if msg.get("role") == "user" else "Assistant"
+                parts.append(f"{role}: {msg.get('content', '')}")
+
+        return LayeredMemoryContext(
+            context="\n".join(parts),
+            summary=summary,
+            preferences=preferences,
+            related_history=related_history,
+            recent_messages=recent_messages,
+        )
+
+    async def _save_conversation_history(
+        self,
+        user_id: str,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        llm: Any | None,
+    ) -> None:
+        if not self.conversation_history.available or len(messages) < 2:
+            return
+
+        question = ""
+        answer = ""
+        for msg in messages:
+            if msg.get("role") == "user" and not question:
+                question = str(msg.get("content", "")).strip()
+            elif msg.get("role") == "assistant":
+                answer = str(msg.get("content", "")).strip()
+
+        if not question or not answer:
+            return
+
+        answer_summary = await self._summarize_history_answer(
+            question=question,
+            answer=answer,
+            llm=llm,
+        )
+        if not answer_summary:
+            return
+
+        await self.conversation_history.save_history(
+            user_id=user_id,
+            session_id=session_id,
+            question=question,
+            answer_summary=answer_summary,
+        )
+
+    async def _summarize_history_answer(
+        self,
+        question: str,
+        answer: str,
+        llm: Any | None,
+    ) -> str:
+        if not llm:
+            return answer[:_HISTORY_SUMMARY_MAX_CHARS]
+
+        prompt = f"""请把下面这一轮客服对话压缩成可用于跨会话召回的历史片段。
+要求：
+- 只保留用户问题、业务事实、关键结论和必要条件。
+- 不要加入原文没有的信息。
+- 不要保留客套话、表情和无关解释。
+- 控制在 {_HISTORY_SUMMARY_MAX_CHARS} 个中文字符以内。
+
+用户问题：
+{question}
+
+客服回答：
+{answer}
+"""
+        try:
+            from langchain_core.messages import HumanMessage
+
+            response = await llm.ainvoke([HumanMessage(content=prompt)])
+            summary = str(getattr(response, "content", response)).strip()
+            return summary[:_HISTORY_SUMMARY_MAX_CHARS]
+        except Exception as exc:
+            logger.warning("[MEMORY] History summary failed, using fallback: %s", exc)
+            return answer[:_HISTORY_SUMMARY_MAX_CHARS]
+
+    async def _update_session_summary(
+        self,
+        user_id: str,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        llm: Any,
+    ) -> bool:
+        non_system = [m for m in messages if m.get("role") != "system"]
+        if len(non_system) <= _SUMMARY_TRIGGER_MESSAGES:
+            return False
+
+        older_messages = non_system[:-_RECENT_CONTEXT_MESSAGES]
+        recent_messages = non_system[-_RECENT_CONTEXT_MESSAGES:]
+        if not older_messages:
+            return False
+
+        previous_summary = await self.short_term.get_summary(user_id, session_id)
+        new_summary = await self._summarize_session(
+            user_id=user_id,
+            session_id=session_id,
+            previous_summary=previous_summary,
+            messages=older_messages,
+            llm=llm,
+        )
+        if not new_summary:
+            return False
+
+        await self.short_term.save_summary(user_id, session_id, new_summary)
+        await self.short_term.save_messages(user_id, session_id, recent_messages)
+        return True
+
+    async def _summarize_session(
+        self,
+        user_id: str,
+        session_id: str,
+        previous_summary: str,
+        messages: list[dict[str, Any]],
+        llm: Any,
+    ) -> str:
+        conversation_text = "\n".join(
+            f"{m.get('role', 'unknown')}: {m.get('content', '')}" for m in messages
+        )
+        prompt = f"""请把以下会话信息压缩成一段面向客服 Agent 的会话摘要。
+
+要求：
+- 保留用户当前目标、已确认事实、偏好、约束、尚未解决的问题。
+- 删除寒暄、重复表达和无关细节。
+- 不要编造原文没有的信息。
+- 控制在 {_SUMMARY_MAX_CHARS} 个中文字符以内。
+
+已有摘要：
+{previous_summary or "暂无"}
+
+需要合并进摘要的较早对话：
+{conversation_text}
+"""
+        try:
+            from langchain_core.messages import HumanMessage
+
+            response = await llm.ainvoke([HumanMessage(content=prompt)])
+            summary = str(getattr(response, "content", response)).strip()
+            if len(summary) > _SUMMARY_MAX_CHARS:
+                summary = summary[:_SUMMARY_MAX_CHARS]
+            return summary
+        except Exception as exc:
+            logger.warning("[MEMORY] Session summary update failed for %s:%s: %s", user_id, session_id, exc)
+            return ""
 
     # ------------------------------------------------------------------
     # Long-term preference operations

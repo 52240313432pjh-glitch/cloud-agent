@@ -10,7 +10,6 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = "long_term_memory"
-EMBEDDING_DIM = 1536  
 
 
 class LongTermMemory:
@@ -39,12 +38,14 @@ class LongTermMemory:
         api_key: str | None = None,
         embedding_api_key: str | None = None,
         embedding_model: str = "text-embedding-v2",
+        embedding_dim: int = 1536,
     ) -> None:
         self._host = host
         self._port = port
         self._api_key = api_key
         self._embedding_api_key = embedding_api_key
         self._embedding_model = embedding_model
+        self._embedding_dim = embedding_dim
         self._client: Any = None
         self._embeddings: Any = None
         self._available: bool = False
@@ -196,7 +197,7 @@ class LongTermMemory:
         schema.add_field("user_id", DataType.VARCHAR, max_length=128)
         schema.add_field("content", DataType.VARCHAR, max_length=2048)
         schema.add_field("memory_type", DataType.VARCHAR, max_length=64)
-        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM)
+        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=self._embedding_dim)
 
         index_params = self._client.prepare_index_params()
         index_params.add_index(

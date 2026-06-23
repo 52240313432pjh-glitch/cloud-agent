@@ -128,12 +128,49 @@ class ShortTermMemory:
         messages.append({"role": role, "content": content})
         await self.save_messages(user_id, session_id, messages)
 
+    async def get_summary(self, user_id: str, session_id: str) -> str:
+        """Return the current session summary from Redis."""
+        if not self._available:
+            return ""
+        try:
+            return await self._client.get(self._summary_key(user_id, session_id)) or ""
+        except Exception as exc:
+            logger.warning("ShortTermMemory.get_summary failed: %s", exc)
+            self._available = False
+            return ""
+
+    async def save_summary(self, user_id: str, session_id: str, summary: str) -> None:
+        """Persist the current session summary with the same TTL as messages."""
+        if not self._available:
+            return
+        try:
+            await self._client.set(
+                self._summary_key(user_id, session_id),
+                summary,
+                ex=self._ttl,
+            )
+        except Exception as exc:
+            logger.warning("ShortTermMemory.save_summary failed: %s", exc)
+            self._available = False
+
+    async def clear_summary(self, user_id: str, session_id: str) -> None:
+        """Delete the session summary for a user/session."""
+        if not self._available:
+            return
+        try:
+            await self._client.delete(self._summary_key(user_id, session_id))
+        except Exception as exc:
+            logger.error("ShortTermMemory.clear_summary failed: %s", exc)
+
     async def clear(self, user_id: str, session_id: str) -> None:
         """Delete all messages for a user/session."""
         if not self._available:
             return
         try:
-            await self._client.delete(self._key(user_id, session_id))
+            await self._client.delete(
+                self._key(user_id, session_id),
+                self._summary_key(user_id, session_id),
+            )
         except Exception as exc:
             logger.error("ShortTermMemory.clear failed: %s", exc)
 
@@ -149,6 +186,10 @@ class ShortTermMemory:
     @staticmethod
     def _key(user_id: str, session_id: str) -> str:
         return f"memory:short:{user_id}:{session_id}"
+
+    @staticmethod
+    def _summary_key(user_id: str, session_id: str) -> str:
+        return f"memory:summary:{user_id}:{session_id}"
 
     @staticmethod
     def _trim(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

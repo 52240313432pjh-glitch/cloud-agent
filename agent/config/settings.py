@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     dashscope_api_key: str = Field(alias="DASHSCOPE_API_KEY")
     model: str = Field(default="qwen-plus", alias="MODEL")
     embedding_model: str = Field(default="text-embedding-v2", alias="EMBEDDING_MODEL")
+    embedding_dim: int = Field(default=1536, alias="EMBEDDING_DIM")
     base_url: str | None = Field(default=None, alias="BASE_URL")
     
     # MCP Configuration

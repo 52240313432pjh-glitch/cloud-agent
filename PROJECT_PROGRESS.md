@@ -264,7 +264,18 @@
   - 点击后调用 `GET /api/traces/{trace_id}` 获取完整事件链。
   - 通过抽屉展示总耗时、缓存状态、路由结果、关键耗时拆解和事件时间线。
 
-### 27. 项目 GitHub 仓库重建
+### 27. L1/L2/L3 记忆分层
+
+- 状态：已完成
+- 涉及模块：`agent/core/memory/short_term.py`, `agent/core/memory/memory_manager.py`, `app/service/chat_service.py`
+- 功能说明：
+  - L1 最近原文：保留最近 3 轮对话原文，保证当前会话连续性。
+  - L2 会话摘要：当会话历史超过阈值时，用 LLM 压缩较早对话并写入 Redis。
+  - L3 长期偏好：继续从 Milvus 检索当前 query 相关的用户长期偏好。
+  - Agent 上下文统一按“会话摘要 + 长期用户偏好 + 最近对话”拼接。
+  - Trace 的 `memory_loaded` 事件增加摘要长度、最近消息数和长期偏好数量。
+
+### 28. 项目 GitHub 仓库重建
 
 - 状态：已完成
 - 涉及模块：Git 仓库
@@ -274,7 +285,7 @@
   - 重新推送 `main` 和 `develop` 分支到 GitHub。
   - 旧 `.git` 已本地备份为 `.git_backup_before_reinit/` 并加入忽略规则。
 
-### 28. 项目 README 和忽略规则
+### 29. 项目 README 和忽略规则
 
 - 状态：已完成
 - 涉及模块：`README.md`, `.gitignore`
@@ -283,10 +294,35 @@
   - 忽略 `.env`、虚拟环境、`node_modules`、本地模型、数据库 volume、学习资料等不应入库内容。
   - 降低密钥泄露和仓库污染风险。
 
+### 30. 语义缓存 COSINE 分数修正
+
+- 状态：已完成
+- 涉及模块：`app/infra/cache.py`, `app/service/chat_service.py`
+- 功能说明：
+  - 修正 Milvus COSINE 检索结果的判定逻辑：按 `similarity >= 0.86` 判断是否命中。
+  - 增加 `cosine_distance = 1 - similarity`，避免把负数相似度误当作“小距离”。
+  - Trace 中缓存命中事件改为记录 `similarity` 和 `cosine_distance`。
+  - 保留旧 `distance` 字段作为兼容值，避免现有日志打印逻辑报错。
+
+### 31. L4 跨会话相关历史记忆
+
+- 状态：已完成
+- 涉及模块：`agent/core/memory/conversation_history.py`, `agent/core/memory/memory_manager.py`, `app/service/chat_service.py`
+- 功能说明：
+  - 新增独立 Milvus Collection：`conversation_history_memory`。
+  - 每轮有效问答结束后，将问答压缩为历史片段并写入 L4。
+  - 新一轮提问时按当前 query 检索同一用户、不同 session 的相关历史。
+  - Agent 上下文新增“跨会话相关历史”层，顺序为会话摘要、长期偏好、跨会话历史、最近对话。
+  - Trace 的 `memory_loaded` 事件增加 `related_history_count` 和 `related_history_chars`。
+  - Embedding 模型和维度遵从 `.env` 中的 `EMBEDDING_MODEL`、`EMBEDDING_DIM`。
+
 ## 开发记录
 
 | 日期 | 功能 | 状态 | 说明 |
 | --- | --- | --- | --- |
+| 2026-06-23 | L4 跨会话相关历史记忆 | 已完成 | 新增独立 Milvus 历史记忆集合，支持跨 session 召回相关历史，并接入 Agent 上下文和 Trace。 |
+| 2026-06-23 | 语义缓存 COSINE 分数修正 | 已完成 | 使用 similarity 阈值判定语义缓存命中，并计算 cosine_distance，修复负数误命中问题。 |
+| 2026-06-23 | L1/L2/L3 记忆分层 | 已完成 | 增加 Redis 会话摘要，组合会话摘要、长期偏好和最近原文作为 Agent 上下文。 |
 | 2026-06-23 | 前端 Trace 面板 | 已完成 | AI 回复绑定 trace_id，支持查看链路抽屉、耗时指标和事件时间线。 |
 | 2026-06-23 | Trace JSONL 落文件与查询接口 | 已完成 | Trace 事件写入 `logs/agent_trace.jsonl`，并提供最近列表和详情查询接口。 |
 | 2026-06-22 | ProductAgent 内部 Trace | 已完成 | 增加 ProductAgent、内部 LLM、向量检索和知识图谱检索的链路日志。 |

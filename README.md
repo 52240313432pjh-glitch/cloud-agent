@@ -8,7 +8,7 @@
 - MCP 工具调用：通过 FastMCP 暴露云资源、订单、商品、推广素材等工具，并在工具调用前注入当前用户身份，降低越权风险。
 - 混合检索：结合 Milvus 向量检索与 Neo4j 知识图谱查询，提高云产品知识问答的覆盖率。
 - 语义缓存：高频相似问题优先走缓存，减少模型调用和响应延迟。
-- 记忆系统：Redis 保存短期对话上下文，Milvus 保存长期用户偏好。
+- 四层记忆系统：Redis 保存最近原文和会话摘要，Milvus 保存长期用户偏好和跨会话相关历史。
 - 本地模型支持：可通过 vLLM 部署本地 Qwen2.5 作为 LLM，同时继续使用 DashScope Embedding 作为向量模型。
 - 前后端分离：FastAPI 提供接口，Vue + Element Plus 提供聊天界面。
 
@@ -26,6 +26,17 @@
 | 知识图谱 | Neo4j |
 | 短期记忆 | Redis |
 | 业务数据 | MySQL |
+
+## 四层记忆系统
+
+项目已接入 L1-L4 分层记忆，用于在控制 token 成本的同时保留更多上下文：
+
+- L1 最近原文：Redis 保存最近几轮对话，保证当前会话连续性。
+- L2 会话摘要：Redis 保存当前 session 的压缩摘要，减少长对话 token 消耗。
+- L3 长期偏好：Milvus 保存用户偏好、习惯和稳定事实。
+- L4 跨会话相关历史：Milvus 独立集合 `conversation_history_memory` 保存历史问答摘要，新 session 可按当前问题召回相关历史。
+
+记忆上下文会按“会话摘要 + 长期用户偏好 + 跨会话相关历史 + 最近对话”的顺序注入 Agent。
 
 ## 目录结构
 
@@ -78,6 +89,7 @@ DASHSCOPE_API_KEY=your_dashscope_api_key
 BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 MODEL=qwen-plus
 EMBEDDING_MODEL=text-embedding-v2
+EMBEDDING_DIM=1536
 ```
 
 如果使用本地 vLLM Qwen 作为 LLM，但 Embedding 仍使用 DashScope：
@@ -87,6 +99,7 @@ DASHSCOPE_API_KEY=your_dashscope_api_key
 BASE_URL=http://localhost:8001/v1
 MODEL=Qwen/Qwen2.5-7B-Instruct
 EMBEDDING_MODEL=text-embedding-v2
+EMBEDDING_DIM=1536
 ```
 
 注意：`agent/.env` 包含密钥和数据库密码，已被 `.gitignore` 忽略，不要提交到仓库。
